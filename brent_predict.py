@@ -66,7 +66,7 @@ def fetch_all_fuel_data():
         return pd.DataFrame()
 
 # --- LOGIQUE MÉTIER ---
-st.title("⛽ Dashboard Carburants - Filtre Récence")
+st.title("Mapping des stations-essence")
 
 df = fetch_all_fuel_data()
 
