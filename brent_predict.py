@@ -9,7 +9,7 @@ from streamlit_folium import st_folium
 from datetime import datetime
 import numpy as np
 
-# --- MOTEUR DE DONNÉES CONSOLIDÉES ---
+# --- MOTEUR DE DONNÉES ---
 @st.cache_data(ttl=1800)
 def fetch_full_occitan_data():
     url = "https://donnees.roulez-eco.fr/opendata/instantane"
@@ -30,12 +30,17 @@ def fetch_full_occitan_data():
             adr = (pdv.findtext('adresse') or "").upper()
             vil = (pdv.findtext('ville') or "").upper()
             
-            # Identification enseigne
+            # Identification enseigne (Correction pour 'U')
             enseigne = "INDÉPENDANT"
-            for m in ['TOTAL', 'LECLERC', 'CARREFOUR', 'INTERMARCHE', 'ESSO', 'AVIA', 'BP', 'U', 'CASINO', 'AUCHAN']:
-                if m in adr or m in vil or (m == 'U' and ' SYSTEME U ' in adr):
+            marques = ['TOTAL', 'LECLERC', 'CARREFOUR', 'INTERMARCHE', 'ESSO', 'AVIA', 'BP', 'CASINO', 'AUCHAN']
+            for m in marques:
+                if m in adr or m in vil:
                     enseigne = m
                     break
+            
+            if enseigne == "INDÉPENDANT":
+                if " SYSTEME U " in adr or " SUPER U " in adr or " HYPER U " in adr or " MARCHE U " in adr:
+                    enseigne = "U"
 
             stations_dict[s_id] = {
                 'id': s_id,
@@ -45,22 +50,16 @@ def fetch_full_occitan_data():
                 'adresse': adr,
                 'enseigne': enseigne,
                 'cp': cp,
-                'prix_data': {}
+                'prix_data': {prix.get('nom'): {'val': float(prix.get('valeur')), 'maj': pd.to_datetime(prix.get('maj'), errors='coerce')} 
+                             for prix in pdv.findall('prix')}
             }
-            
-            for prix in pdv.findall('prix'):
-                nom = prix.get('nom')
-                stations_dict[s_id]['prix_data'][nom] = {
-                    'val': float(prix.get('valeur')),
-                    'maj': pd.to_datetime(prix.get('maj'), errors='coerce')
-                }
-        
         return stations_dict
     except Exception as e:
         st.error(f"Erreur technique : {e}")
         return {}
 
 def get_distance(lat1, lon1, lat2, lon2):
+    if None in [lat1, lon1, lat2, lon2]: return 999
     return np.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2) * 111
 
 # --- INTERFACE ---
@@ -74,15 +73,18 @@ if all_stations:
         
         filtered = [s for s in all_stations.values() if search in s['ville'] or s['cp'].startswith(search)]
         
+        my_id = None
         if filtered:
             options = {f"{s['enseigne']} - {s['ville']} ({s['id']})": s['id'] for s in filtered}
-            my_id = st.selectbox("Choisir ma station", options=list(options.keys()))
-            radius = st.slider("Rayon de veille (km)", 2, 20, 5)
+            selected_label = st.selectbox("Choisir ma station", options=list(options.keys()))
+            my_id = options[selected_label]
         else:
-            st.warning("Aucun résultat.")
-            my_id = None
+            st.warning("Aucun résultat pour cette recherche.")
 
-    if my_id:
+        radius = st.slider("Rayon de veille (km)", 2, 20, 5)
+
+    # CORRECTION DU KEYERROR : Vérifier si my_id existe dans le dictionnaire actuel
+    if my_id and my_id in all_stations:
         me = all_stations[my_id]
         
         # Calcul de la concurrence
@@ -91,55 +93,49 @@ if all_stations:
             if s_id == my_id: continue
             d = get_distance(me['lat'], me['lon'], s_data['lat'], s_data['lon'])
             if d <= radius:
-                s_data['dist'] = d
-                comps.append(s_data)
+                s_data_copy = s_data.copy()
+                s_data_copy['dist'] = d
+                comps.append(s_data_copy)
 
         # --- MAP ---
         m = folium.Map(location=[me['lat'], me['lon']], zoom_start=13, tiles="cartodbpositron")
-        folium.Marker([me['lat'], me['lon']], icon=folium.Icon(color='black', icon='star')).add_to(m)
+        folium.Marker([me['lat'], me['lon']], 
+                      icon=folium.Icon(color='black', icon='star', prefix='fa'),
+                      tooltip="MA STATION").add_to(m)
 
         for s in comps:
-            # Construction du Tooltip Multi-carburants
-            prix_html = "".join([f"<li><b>{n}:</b> {p['val']:.3f}€</li>" for n, p in s['prix_data'].items()])
+            prix_items = [f"<li><b>{n}:</b> {p['val']:.3f}€</li>" for n, p in s['prix_data'].items()]
+            prix_html = "".join(prix_items) if prix_items else "<li>Aucun prix dispo</li>"
             
             html = f"""
-            <div style="font-family: sans-serif; width: 200px;">
+            <div style="font-family: sans-serif; width: 180px;">
                 <b>{s['enseigne']}</b><br><small>{s['adresse']}</small><hr>
                 <ul style="list-style:none; padding:0; margin:0; font-size:12px;">{prix_html}</ul>
                 <br><small>Distance: {s['dist']:.1f} km</small>
             </div>
             """
-            
             folium.Marker(
                 [s['lat'], s['lon']],
                 popup=folium.Popup(html, max_width=250),
                 icon=folium.Icon(color='blue', icon='gas-pump', prefix='fa')
             ).add_to(m)
 
-        st_folium(m, width="100%", height=500)
+        st_folium(m, width="100%", height=500, key="main_map")
 
-        # --- TABLEAU DE DÉTAILS MULTI-PRIX ---
+        # --- TABLEAU ---
         st.subheader("📋 Comparatif complet de la zone")
-        
-        table_data = []
         all_fuel_types = sorted(list(set(f for s in comps + [me] for f in s['prix_data'].keys())))
         
+        table_data = []
         for s in [me] + sorted(comps, key=lambda x: x['dist']):
-            row = {
-                "Station": f"{s['enseigne']} ({s['id']})",
-                "Ville": s['ville'],
-                "Dist.": 0 if s['id'] == my_id else round(s['dist'], 1)
-            }
+            row = {"Station": f"{s['enseigne']}", "Ville": s['ville'], "Dist.": 0 if s['id'] == my_id else round(s['dist'], 1)}
             for f in all_fuel_types:
                 row[f] = s['prix_data'].get(f, {}).get('val')
             table_data.append(row)
             
-        df_table = pd.DataFrame(table_data)
-        st.dataframe(df_table, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("Sélectionnez une station dans la barre latérale pour lancer l'analyse.")
 
 else:
-    st.error("Données indisponibles.")
-
-# --- ANALYSE BRUTALE ---
-st.divider()
-st.info("**Stratégie Cross-Fuel :** Regarde ton tableau. Si tu es le moins cher sur le Gazole mais le plus cher sur le SP95, tu n'attires que les professionnels (camionnettes) et tu rates les familles. Un gérant expert équilibre ses marges sur l'ensemble du totem, pas par produit isolé.")
+    st.error("Échec du chargement des données. L'API gouvernementale est peut-être saturée.")
