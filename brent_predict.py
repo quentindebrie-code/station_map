@@ -6,15 +6,12 @@ import io
 import xml.etree.ElementTree as ET
 import folium
 from streamlit_folium import st_folium
-from folium.plugins import MarkerCluster
 from datetime import datetime, timedelta
 import numpy as np
 
-# --- CONFIGURATION & DATA ENGINE ---
-st.set_page_config(page_title="Hympyr Business Intel - Occitanie", layout="wide")
-
+# --- MOTEUR DE DONNÉES ---
 @st.cache_data(ttl=1800)
-def fetch_and_process_data():
+def fetch_smart_data():
     url = "https://donnees.roulez-eco.fr/opendata/instantane"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
@@ -26,16 +23,25 @@ def fetch_and_process_data():
         data = []
         for pdv in root.findall('pdv'):
             cp = pdv.get('cp') or ""
-            # Focus Occitanie (Départements 09, 11, 12, 30, 31, 32, 34, 46, 48, 65, 66, 81, 82)
             if not cp.startswith(('09', '11', '12', '30', '31', '32', '34', '46', '48', '65', '66', '81', '82')):
                 continue
-                
+            
+            # Détection Enseigne
+            adr = (pdv.findtext('adresse') or "").upper()
+            vil = (pdv.findtext('ville') or "").upper()
+            enseigne = "INDÉPENDANT"
+            for m in ['TOTAL', 'LECLERC', 'CARREFOUR', 'INTERMARCHE', 'ESSO', 'AVIA', 'BP', 'U', 'CASINO', 'AUCHAN']:
+                if m in adr or m in vil:
+                    enseigne = m
+                    break
+
             base = {
                 'id': pdv.get('id'),
                 'lat': float(pdv.get('latitude')) / 100000 if pdv.get('latitude') else None,
                 'lon': float(pdv.get('longitude')) / 100000 if pdv.get('longitude') else None,
-                'ville': (pdv.findtext('ville') or "NC").upper(),
-                'adresse': pdv.findtext('adresse') or ""
+                'ville': vil,
+                'adresse': adr,
+                'enseigne': enseigne
             }
             
             for prix in pdv.findall('prix'):
@@ -48,95 +54,72 @@ def fetch_and_process_data():
                 data.append(d)
         return pd.DataFrame(data).dropna(subset=['lat', 'lon', 'prix'])
     except Exception as e:
-        st.error(f"Erreur d'acquisition : {e}")
+        st.error(f"Erreur : {e}")
         return pd.DataFrame()
 
 def haversine(lat1, lon1, lat2, lon2):
-    # Calcul de distance simplifié pour performance
     return np.sqrt((lat1 - lat2)**2 + (lon1 - lon2)**2) * 111
 
-# --- INTERFACE DE DÉCISION ---
-st.title("🚀 Hympyr : Yield Management Carburant")
-st.markdown("---")
-
-df = fetch_and_process_data()
+# --- INTERFACE ---
+st.set_page_config(page_title="Hympyr - Concurrent Intelligence", layout="wide")
+df = fetch_smart_data()
 
 if not df.empty:
     with st.sidebar:
-        st.header("🎯 Ma Station")
-        my_station_id = st.text_input("ID Station (PDV)", value=df['id'].iloc[0])
-        fuel_type = st.selectbox("Type de Carburant", df['carburant'].unique())
-        radius = st.slider("Zone de chalandise (km)", 2, 30, 10)
-        
-    # Isolation de ma station
-    my_data = df[(df['id'] == my_station_id) & (df['carburant'] == fuel_type)]
+        st.title("🛡️ Contrôle")
+        my_id = st.text_input("Mon ID Station", value=df['id'].iloc[0])
+        fuel = st.selectbox("Carburant", df['carburant'].unique())
+        radius = st.slider("Rayon d'analyse (km)", 2, 20, 8)
+
+    my_data = df[(df['id'] == my_id) & (df['carburant'] == fuel)]
     
     if not my_data.empty:
-        my_lat, my_lon = my_data.iloc[0]['lat'], my_data.iloc[0]['lon']
-        my_price = my_data.iloc[0]['prix']
+        me = my_data.iloc[0]
+        df_fuel = df[df['carburant'] == fuel].copy()
+        df_fuel['dist'] = haversine(me['lat'], me['lon'], df_fuel['lat'], df_fuel['lon'])
+        comps = df_fuel[(df_fuel['dist'] <= radius) & (df_fuel['id'] != my_id)].copy()
 
-        # Calcul de la concurrence dans le rayon
-        df_fuel = df[df['carburant'] == fuel_type].copy()
-        df_fuel['dist'] = haversine(my_lat, my_lon, df_fuel['lat'], df_fuel['lon'])
-        competitors = df_fuel[(df_fuel['dist'] <= radius) & (df_fuel['id'] != my_station_id)]
+        # Dashboard
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Prix Ciblé", f"{me['prix']:.3f}€")
+        c2.metric("Moyenne Zone", f"{comps['prix'].mean():.3f}€")
+        c3.metric("Concurrents", len(comps))
 
-        # --- KPI STRATÉGIQUES ---
-        avg_market = competitors['prix'].mean()
-        delta = my_price - avg_market
+        # --- CARTE AVANCÉE ---
+        m = folium.Map(location=[me['lat'], me['lon']], zoom_start=13, tiles="cartodbpositron")
         
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Mon Prix", f"{my_price:.3f} €")
-        c2.metric("Moyenne Zone", f"{avg_market:.3f} €", f"{delta:.3f} €", delta_color="inverse")
-        
-        # Alerte Rupture : Stations sans MAJ depuis 48h
-        stale_limit = datetime.now() - timedelta(hours=48)
-        ruptures = competitors[competitors['maj'] < stale_limit]
-        c3.metric("Ruptures probables", len(ruptures), help="Stations n'ayant pas mis à jour leurs prix depuis 48h")
-        
-        cheaper_count = len(competitors[competitors['prix'] < my_price])
-        c4.metric("Position", f"{cheaper_count + 1} / {len(competitors) + 1}", "Rang prix")
+        # Icône pour Ma Station
+        folium.Marker(
+            [me['lat'], me['lon']],
+            icon=folium.Icon(color='darkred', icon='home', prefix='fa'),
+            tooltip="MA STATION (Focus)"
+        ).add_to(m)
 
-        # --- MAP DE POSITIONNEMENT ---
-        col_left, col_right = st.columns([2, 1])
-        
-        with col_left:
-            st.subheader("📍 Mapping de proximité")
-            m = folium.Map(location=[my_lat, my_lon], zoom_start=13)
+        for _, row in comps.iterrows():
+            # Logique de fraîcheur
+            is_stale = (datetime.now() - row['maj']).total_seconds() > 172800 # 48h
+            color = "orange" if is_stale else ("green" if row['prix'] < me['prix'] else "blue")
             
-            # Ma station
+            # HTML POPUP (L'info détaillée que tu voulais)
+            html = f"""
+            <div style="font-family: Arial, sans-serif; width: 200px;">
+                <h4 style="margin-bottom:5px; color:#2c3e50;">{row['enseigne']}</h4>
+                <hr style="margin:5px 0;">
+                <b>Prix :</b> <span style="font-size:1.2em; color:#e67e22;">{row['prix']:.3f}€</span><br>
+                <b>Distance :</b> {row['dist']:.1f} km<br>
+                <b>MAJ :</b> {row['maj'].strftime('%d/%m %H:%M')}<br>
+                <p style="font-size:0.8em; color:gray;"><i>{row['adresse'].title()}</i></p>
+                {"<b style='color:red;'>⚠️ Donnée suspecte (Périmée)</b>" if is_stale else ""}
+            </div>
+            """
+            
             folium.Marker(
-                [my_lat, my_lon], 
-                popup="MOI", 
-                icon=folium.Icon(color='red', icon='star')
+                [row['lat'], row['lon']],
+                popup=folium.Popup(html, max_width=250),
+                tooltip=f"{row['enseigne']} - {row['prix']}€",
+                icon=folium.Icon(color=color, icon='gas-pump', prefix='fa')
             ).add_to(m)
-            
-            # Concurrents
-            for _, row in competitors.iterrows():
-                color = 'green' if row['prix'] < my_price else 'blue'
-                icon = 'info-sign' if row['maj'] > stale_limit else 'warning-sign'
-                folium.Marker(
-                    [row['lat'], row['lon']],
-                    popup=f"{row['prix']}€ - {row['id']}",
-                    icon=folium.Icon(color=color, icon=icon)
-                ).add_to(m)
-            st_folium(m, width="100%", height=450, returned_objects=[])
 
-        with col_right:
-            st.subheader("📊 Top 5 Concurrents")
-            top_comp = competitors.sort_values('prix').head(5)[['prix', 'dist', 'ville']]
-            st.table(top_comp)
-            
-            if delta < -0.05:
-                st.success("💡 Opportunité : Vous êtes très bas. Possibilité de remonter de 0.02€ sans perdre votre rang.")
-            elif delta > 0.02:
-                st.error("⚠️ Alerte : Vous sortez du tunnel de prix local. Risque de perte de volume.")
-
+        st_folium(m, width="100%", height=600)
     else:
-        st.warning("Entrez un ID de station valide présent en Occitanie pour activer l'analyse.")
-        st.info("Exemples d'ID en base : " + ", ".join(df['id'].head(5).tolist()))
-else:
-    st.error("Impossible de charger les données. Vérifiez l'URL de l'Open Data.")
-
-# --- ANALYSE SANS FILTRE ---
-st.divider()
-st.sidebar.info(f"Dernière synchro : {datetime.now().strftime('%H:%M:%S')}")
+        st.warning("ID non trouvé en Occitanie.")
